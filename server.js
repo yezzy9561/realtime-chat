@@ -8,21 +8,33 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT) || 3100;
-const HISTORY_LIMIT = 200;
+const HISTORY_LIMIT = 200; // 방마다 보관하는 메시지 수
+const LOG_LIMIT = 1000; // 폴링으로 전달하는 변경 기록 수
+const IMAGE_LIMIT = 30; // 방마다 보관하는 사진 수 (넘으면 오래된 것부터 만료)
+const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
+const MAX_ROOMS = 100;
 const MAX_TEXT = 1000;
 const MAX_NAME = 20;
 const POLL_WAIT = 25000; // 새 소식이 없을 때 응답을 붙잡아 두는 시간
 const CLIENT_TIMEOUT = 45000; // 이 시간 동안 폴링이 없으면 퇴장 처리
+const LEAVE_GRACE = 8000; // 새로고침처럼 곧바로 돌아오면 입장/퇴장 안내를 생략
+const ROOM_CLEAR_AFTER = 60000; // 방이 비고 이 시간이 지나면 대화 기록 삭제
+const REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 const INDEX_HTML = fs.readFileSync(path.join(__dirname, "index.html"));
 
-// room -> { seq, history: [{seq, ...msg}], clients: Map<clientId, {name, publicId, lastSeen}>, waiters: Set<fn> }
+/*
+ room = {
+   id, seq, log: [{seq, kind, ...}], history: [msg],
+   clients: Map<clientId, {publicId, name, lastSeen}>,
+   reads: Map<publicId, lastReadSeq>,
+   pendingLeave: Map<publicId, {name, timer}>,
+   imageOrder: [token], waiters: Set<fn>, emptySince
+ }
+ msg = {id, type: "chat"|"image"|"system", name, from, text, image, expired, at, reactions: {emoji: [publicId]}}
+*/
 const rooms = new Map();
-
-function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { seq: 0, history: [], clients: new Map(), waiters: new Set() });
-  return rooms.get(id);
-}
+const images = new Map(); // token -> {buf, type, roomId, msgId}
 
 function cleanRoomId(raw) {
   const id = String(raw || "lobby").trim().slice(0, 40);
@@ -33,8 +45,30 @@ function cleanName(raw) {
   return String(raw || "").replace(/\s+/g, " ").trim().slice(0, MAX_NAME);
 }
 
-function presence(room) {
-  return [...room.clients.values()].map((c) => c.name);
+function getRoom(id, create) {
+  if (!rooms.has(id) && create) {
+    if (rooms.size >= MAX_ROOMS) return null;
+    rooms.set(id, {
+      id,
+      seq: 0,
+      log: [],
+      history: [],
+      clients: new Map(),
+      reads: new Map(),
+      pendingLeave: new Map(),
+      imageOrder: [],
+      waiters: new Set(),
+      emptySince: null,
+    });
+  }
+  return rooms.get(id);
+}
+
+function deleteRoom(room) {
+  for (const token of room.imageOrder) images.delete(token);
+  for (const p of room.pendingLeave.values()) clearTimeout(p.timer);
+  for (const fn of room.waiters) fn();
+  rooms.delete(room.id);
 }
 
 function wake(room) {
@@ -43,11 +77,41 @@ function wake(room) {
   list.forEach((fn) => fn());
 }
 
-function pushMessage(room, msg) {
+function pushLog(room, entry) {
   room.seq += 1;
-  room.history.push({ seq: room.seq, ...msg });
-  if (room.history.length > HISTORY_LIMIT) room.history.shift();
+  room.log.push({ seq: room.seq, ...entry });
+  if (room.log.length > LOG_LIMIT) room.log.shift();
   wake(room);
+  return room.seq;
+}
+
+function addMessage(room, msg) {
+  const id = room.seq + 1;
+  const full = { id, reactions: {}, ...msg };
+  room.history.push(full);
+  if (room.history.length > HISTORY_LIMIT) room.history.shift();
+  pushLog(room, { kind: "msg", msg: full });
+  return full;
+}
+
+function system(room, text) {
+  addMessage(room, { type: "system", text, at: Date.now() });
+}
+
+// 접속자 목록: 같은 사람(publicId)의 여러 연결은 하나로 묶음
+function presence(room) {
+  const seen = new Map();
+  for (const c of room.clients.values()) {
+    if (!seen.has(c.publicId)) {
+      seen.set(c.publicId, { publicId: c.publicId, name: c.name, lastRead: room.reads.get(c.publicId) || 0 });
+    }
+  }
+  return [...seen.values()];
+}
+
+function isPresent(room, publicId) {
+  for (const c of room.clients.values()) if (c.publicId === publicId) return true;
+  return false;
 }
 
 function removeClient(room, clientId) {
@@ -55,7 +119,15 @@ function removeClient(room, clientId) {
   if (!c) return;
   room.clients.delete(clientId);
   rate.delete(clientId);
-  pushMessage(room, { type: "system", text: `${c.name}님이 나갔어요`, at: Date.now() });
+  pushLog(room, { kind: "tick" });
+  if (room.clients.size === 0) room.emptySince = Date.now();
+  if (isPresent(room, c.publicId) || room.pendingLeave.has(c.publicId)) return;
+  // 새로고침이면 곧 다시 들어오므로 퇴장 안내를 잠시 미룸
+  const timer = setTimeout(() => {
+    room.pendingLeave.delete(c.publicId);
+    if (rooms.get(room.id) === room && !isPresent(room, c.publicId)) system(room, `${c.name}님이 나갔어요`);
+  }, LEAVE_GRACE);
+  room.pendingLeave.set(c.publicId, { name: c.name, timer });
 }
 
 // 간단한 도배 방지: 클라이언트당 5초에 10개
@@ -71,15 +143,18 @@ function allowed(clientId) {
 
 function readBody(req, limit = 8 * 1024) {
   return new Promise((resolve, reject) => {
-    let body = "";
+    const chunks = [];
+    let size = 0;
     req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > limit) {
+      size += chunk.length;
+      if (size > limit) {
         reject(new Error("too large"));
         req.destroy();
+        return;
       }
+      chunks.push(chunk);
     });
-    req.on("end", () => resolve(body));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
 }
@@ -87,6 +162,46 @@ function readBody(req, limit = 8 * 1024) {
 function json(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(data));
+}
+
+// data URL을 디코딩하고 실제 파일 시그니처로 이미지인지 확인
+function decodeImage(dataUrl) {
+  const m = /^data:image\/(jpeg|png|webp|gif);base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
+  if (!m) return null;
+  const buf = Buffer.from(m[2], "base64");
+  if (!buf.length || buf.length > MAX_IMAGE_BYTES) return null;
+  const sig = buf.subarray(0, 12);
+  const ok =
+    (sig[0] === 0xff && sig[1] === 0xd8 && sig[2] === 0xff) || // jpeg
+    sig.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])) || // png
+    (sig.subarray(0, 4).toString() === "RIFF" && sig.subarray(8, 12).toString() === "WEBP") ||
+    sig.subarray(0, 4).toString() === "GIF8";
+  if (!ok) return null;
+  return { buf, type: `image/${m[1]}` };
+}
+
+function storeImage(room, msg, img) {
+  const token = crypto.randomBytes(16).toString("hex");
+  images.set(token, { buf: img.buf, type: img.type, roomId: room.id });
+  room.imageOrder.push(token);
+  if (room.imageOrder.length > IMAGE_LIMIT) {
+    const old = room.imageOrder.shift();
+    const oldMsg = room.history.find((m) => m.image === `/img/${old}`);
+    images.delete(old);
+    if (oldMsg) {
+      oldMsg.expired = true;
+      pushLog(room, { kind: "expire", id: oldMsg.id });
+    }
+  }
+  return `/img/${token}`;
+}
+
+// 요청 본문의 room/clientId로 접속 중인 클라이언트를 찾음
+function auth(body) {
+  const room = rooms.get(cleanRoomId(body.room));
+  const client = room && room.clients.get(body.clientId);
+  if (client) client.lastSeen = Date.now();
+  return { room, client };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -97,28 +212,52 @@ const server = http.createServer(async (req, res) => {
     return res.end(INDEX_HTML);
   }
 
-  // 입장
+  if (req.method === "GET" && url.pathname.startsWith("/img/")) {
+    const img = images.get(url.pathname.slice(5));
+    if (!img) {
+      res.writeHead(404);
+      return res.end();
+    }
+    res.writeHead(200, {
+      "Content-Type": img.type,
+      "Cache-Control": "private, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+    });
+    return res.end(img.buf);
+  }
+
+  // 입장. deviceKey는 브라우저 탭마다 고정이라 새로고침해도 같은 사람으로 인식됨
   if (req.method === "POST" && url.pathname === "/join") {
     try {
       const body = JSON.parse(await readBody(req));
       const name = cleanName(body.name);
-      if (!name) return json(res, 400, { error: "name required" });
-      const room = getRoom(cleanRoomId(body.room));
-      const clientId = crypto.randomUUID(); // 전송 권한용(본인만 앎)
-      const publicId = crypto.randomUUID().slice(0, 8); // 메시지에 공개되는 발신자 id
-      room.clients.set(clientId, { name, publicId, lastSeen: Date.now() });
-      pushMessage(room, { type: "system", text: `${name}님이 들어왔어요`, at: Date.now() });
+      const deviceKey = String(body.deviceKey || "").slice(0, 64);
+      if (!name || deviceKey.length < 16) return json(res, 400, { error: "bad request" });
+      const room = getRoom(cleanRoomId(body.room), true);
+      if (!room) return json(res, 503, { error: "too many rooms" });
+
+      const clientId = crypto.randomUUID(); // 요청 권한용(본인만 앎)
+      const publicId = crypto.createHash("sha256").update(`${room.id}:${deviceKey}`).digest("hex").slice(0, 12);
+      const returning = isPresent(room, publicId) || room.pendingLeave.has(publicId);
+      const pending = room.pendingLeave.get(publicId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        room.pendingLeave.delete(publicId);
+      }
+      room.clients.set(clientId, { publicId, name, lastSeen: Date.now() });
+      room.emptySince = null;
+      if (!room.reads.has(publicId)) room.reads.set(publicId, room.seq);
+      if (returning) pushLog(room, { kind: "tick" });
+      else system(room, `${name}님이 들어왔어요`);
       return json(res, 200, { clientId, publicId, seq: room.seq, history: room.history, presence: presence(room) });
     } catch {
       return json(res, 400, { error: "bad request" });
     }
   }
 
-  // 새 소식 받기: since 이후 메시지가 생기거나 POLL_WAIT가 지나면 응답
+  // 새 소식 받기: since 이후 변경이 생기거나 POLL_WAIT가 지나면 응답
   if (req.method === "GET" && url.pathname === "/poll") {
-    const room = rooms.get(cleanRoomId(url.searchParams.get("room")));
-    const clientId = url.searchParams.get("clientId");
-    const client = room && room.clients.get(clientId);
+    const { room, client } = auth({ room: url.searchParams.get("room"), clientId: url.searchParams.get("clientId") });
     if (!client) return json(res, 403, { error: "not joined" });
     const since = Number(url.searchParams.get("since")) || 0;
 
@@ -129,11 +268,12 @@ const server = http.createServer(async (req, res) => {
       clearTimeout(timer);
       room.waiters.delete(reply);
       client.lastSeen = Date.now();
-      json(res, 200, {
-        seq: room.seq,
-        events: room.history.filter((m) => m.seq > since),
-        presence: presence(room),
-      });
+      const oldest = room.log.length ? room.log[0].seq : room.seq + 1;
+      if (since < oldest - 1 || since > room.seq) {
+        // 놓친 변경이 너무 많으면 전체를 다시 보냄
+        return json(res, 200, { reset: true, seq: room.seq, history: room.history, presence: presence(room) });
+      }
+      json(res, 200, { seq: room.seq, events: room.log.filter((e) => e.seq > since), presence: presence(room) });
     };
     const timer = setTimeout(reply, POLL_WAIT);
     req.on("close", () => {
@@ -141,30 +281,71 @@ const server = http.createServer(async (req, res) => {
       clearTimeout(timer);
       room.waiters.delete(reply);
     });
-    client.lastSeen = Date.now();
-    if (room.seq > since) return reply();
+    if (room.seq !== since) return reply();
     room.waiters.add(reply);
     return;
   }
 
-  // 메시지 전송
+  // 메시지·사진 전송
   if (req.method === "POST" && url.pathname === "/send") {
     try {
-      const { room: roomId, clientId, text } = JSON.parse(await readBody(req));
-      const room = rooms.get(cleanRoomId(roomId));
-      const client = room && room.clients.get(clientId);
-      const clean = String(text || "").trim().slice(0, MAX_TEXT);
+      const body = JSON.parse(await readBody(req, 2.2 * 1024 * 1024));
+      const { room, client } = auth(body);
       if (!client) return json(res, 403, { error: "not joined" });
-      if (!clean) return json(res, 400, { error: "empty" });
-      if (!allowed(clientId)) return json(res, 429, { error: "slow down" });
-      client.lastSeen = Date.now();
-      pushMessage(room, {
-        type: "chat",
-        name: client.name,
-        from: client.publicId,
-        text: clean,
-        at: Date.now(),
-      });
+      if (!allowed(body.clientId)) return json(res, 429, { error: "slow down" });
+      const base = { name: client.name, from: client.publicId, at: Date.now() };
+
+      if (body.image) {
+        const img = decodeImage(body.image);
+        if (!img) return json(res, 400, { error: "bad image" });
+        const msg = { type: "image", ...base, image: null };
+        msg.image = storeImage(room, msg, img);
+        addMessage(room, msg);
+      } else {
+        const text = String(body.text || "").trim().slice(0, MAX_TEXT);
+        if (!text) return json(res, 400, { error: "empty" });
+        addMessage(room, { type: "chat", ...base, text });
+      }
+      room.reads.set(client.publicId, room.seq); // 내가 보낸 건 읽은 것으로
+      return json(res, 200, { ok: true });
+    } catch (e) {
+      return json(res, e.message === "too large" ? 413 : 400, { error: "bad request" });
+    }
+  }
+
+  // 반응 달기/취소
+  if (req.method === "POST" && url.pathname === "/react") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { room, client } = auth(body);
+      if (!client) return json(res, 403, { error: "not joined" });
+      if (!REACTIONS.includes(body.emoji)) return json(res, 400, { error: "bad emoji" });
+      const msg = room.history.find((m) => m.id === Number(body.id) && m.type !== "system");
+      if (!msg) return json(res, 404, { error: "no message" });
+      const list = msg.reactions[body.emoji] || [];
+      const i = list.indexOf(client.publicId);
+      if (i >= 0) list.splice(i, 1);
+      else list.push(client.publicId);
+      if (list.length) msg.reactions[body.emoji] = list;
+      else delete msg.reactions[body.emoji];
+      pushLog(room, { kind: "react", id: msg.id, reactions: msg.reactions });
+      return json(res, 200, { ok: true });
+    } catch {
+      return json(res, 400, { error: "bad request" });
+    }
+  }
+
+  // 읽음 위치 갱신 (안 읽은 사람 수 계산용)
+  if (req.method === "POST" && url.pathname === "/read") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { room, client } = auth(body);
+      if (!client) return json(res, 403, { error: "not joined" });
+      const seq = Math.min(Number(body.seq) || 0, room.seq);
+      if (seq > (room.reads.get(client.publicId) || 0)) {
+        room.reads.set(client.publicId, seq);
+        pushLog(room, { kind: "tick" });
+      }
       return json(res, 200, { ok: true });
     } catch {
       return json(res, 400, { error: "bad request" });
@@ -174,9 +355,9 @@ const server = http.createServer(async (req, res) => {
   // 퇴장 (창 닫을 때 sendBeacon)
   if (req.method === "POST" && url.pathname === "/leave") {
     try {
-      const { room: roomId, clientId } = JSON.parse(await readBody(req));
-      const room = rooms.get(cleanRoomId(roomId));
-      if (room) removeClient(room, clientId);
+      const body = JSON.parse(await readBody(req));
+      const room = rooms.get(cleanRoomId(body.room));
+      if (room) removeClient(room, body.clientId);
     } catch {}
     res.writeHead(204);
     return res.end();
@@ -186,13 +367,15 @@ const server = http.createServer(async (req, res) => {
   res.end("not found");
 });
 
-// 창을 닫았는데 퇴장 신호가 못 온 사람 정리
 setInterval(() => {
   const now = Date.now();
-  for (const room of rooms.values()) {
+  for (const room of [...rooms.values()]) {
+    // 창을 닫았는데 퇴장 신호가 못 온 사람 정리
     for (const [id, c] of room.clients) {
       if (now - c.lastSeen > CLIENT_TIMEOUT) removeClient(room, id);
     }
+    // 마지막 사람이 나가고 일정 시간이 지나면 방과 대화 기록 삭제
+    if (room.clients.size === 0 && room.emptySince && now - room.emptySince > ROOM_CLEAR_AFTER) deleteRoom(room);
   }
 }, 10000);
 
