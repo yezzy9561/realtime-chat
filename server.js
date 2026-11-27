@@ -12,6 +12,13 @@ const HISTORY_LIMIT = 200; // 방마다 보관하는 메시지 수
 const LOG_LIMIT = 1000; // 폴링으로 전달하는 변경 기록 수
 const IMAGE_LIMIT = 30; // 방마다 보관하는 사진 수 (넘으면 오래된 것부터 만료)
 const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
+const MAX_FILE_BYTES = 20 * 1024 * 1024; // 첨부파일 하나
+const ROOM_FILE_BYTES = 80 * 1024 * 1024; // 방마다 보관하는 첨부파일 총량 (넘으면 오래된 것부터 만료)
+const TOTAL_FILE_BYTES = 250 * 1024 * 1024; // 서버 전체 첨부파일 상한 (무료 서버 메모리 512MB)
+// 외부인과 쓰는 방이라 실행 파일은 받지 않음
+const BLOCKED_EXT = new Set(
+  "exe bat cmd com msi msp scr pif cpl dll sys js jse vbs vbe wsf wsh hta ps1 psm1 psd1 reg lnk jar msc appx msix appxbundle application gadget sh".split(" ")
+);
 const MAX_ROOMS = 100;
 const MAX_TEXT = 1000;
 const MAX_NAME = 20;
@@ -29,12 +36,14 @@ const INDEX_HTML = fs.readFileSync(path.join(__dirname, "index.html"));
    clients: Map<clientId, {publicId, name, lastSeen}>,
    reads: Map<publicId, lastReadSeq>,
    pendingLeave: Map<publicId, {name, timer}>,
-   imageOrder: [token], waiters: Set<fn>, emptySince
+   imageOrder: [token], fileOrder: [token], fileBytes, waiters: Set<fn>, emptySince
  }
- msg = {id, type: "chat"|"image"|"system", name, from, text, image, expired, at, reactions: {emoji: [publicId]}}
+ msg = {id, type: "chat"|"image"|"file"|"system", name, from, text, image, file: {name, size, url}, expired, at, reactions: {emoji: [publicId]}}
 */
 const rooms = new Map();
 const images = new Map(); // token -> {buf, type, roomId, msgId}
+const files = new Map(); // token -> {buf, name, roomId}
+let totalFileBytes = 0;
 
 function cleanRoomId(raw) {
   const id = String(raw || "lobby").trim().slice(0, 40);
@@ -57,6 +66,8 @@ function getRoom(id, create) {
       reads: new Map(),
       pendingLeave: new Map(),
       imageOrder: [],
+      fileOrder: [],
+      fileBytes: 0,
       waiters: new Set(),
       emptySince: null,
     });
@@ -66,6 +77,7 @@ function getRoom(id, create) {
 
 function deleteRoom(room) {
   for (const token of room.imageOrder) images.delete(token);
+  for (const token of room.fileOrder) dropFile(token);
   for (const p of room.pendingLeave.values()) clearTimeout(p.timer);
   for (const fn of room.waiters) fn();
   rooms.delete(room.id);
@@ -196,6 +208,63 @@ function storeImage(room, msg, img) {
   return `/img/${token}`;
 }
 
+function cleanFileName(raw) {
+  const name = String(raw || "")
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, "_")
+    .trim()
+    .slice(-120);
+  return name || "파일";
+}
+
+const extOf = (name) => (/\.([^.]+)$/.exec(name) || [])[1]?.toLowerCase() || "";
+
+function dropFile(token) {
+  const f = files.get(token);
+  if (!f) return;
+  totalFileBytes -= f.buf.length;
+  files.delete(token);
+}
+
+// 방 보관량을 넘으면 오래된 파일부터 만료
+function storeFile(room, name, buf) {
+  const token = crypto.randomBytes(16).toString("hex");
+  files.set(token, { buf, name, roomId: room.id });
+  totalFileBytes += buf.length;
+  room.fileOrder.push(token);
+  room.fileBytes += buf.length;
+  while (room.fileBytes > ROOM_FILE_BYTES && room.fileOrder.length > 1) {
+    const old = room.fileOrder.shift();
+    const f = files.get(old);
+    if (f) room.fileBytes -= f.buf.length;
+    dropFile(old);
+    const oldMsg = room.history.find((m) => m.file && m.file.url === `/file/${old}`);
+    if (oldMsg) {
+      oldMsg.expired = true;
+      pushLog(room, { kind: "expire", id: oldMsg.id });
+    }
+  }
+  return `/file/${token}`;
+}
+
+// 업로드 본문을 받으면서 크기 제한을 확인
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("too large"));
+        req.pause();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 // 요청 본문의 room/clientId로 접속 중인 클라이언트를 찾음
 function auth(body) {
   const room = rooms.get(cleanRoomId(body.room));
@@ -224,6 +293,53 @@ const server = http.createServer(async (req, res) => {
       "X-Content-Type-Options": "nosniff",
     });
     return res.end(img.buf);
+  }
+
+  // 첨부파일 내려받기: 브라우저에서 열리지 않고 항상 다운로드되게 함
+  if (req.method === "GET" && url.pathname.startsWith("/file/")) {
+    const f = files.get(url.pathname.slice(6));
+    if (!f) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      return res.end("보관 기간이 지난 파일이에요.");
+    }
+    const ascii = f.name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "");
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": f.buf.length,
+      "Content-Disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(f.name)}`,
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "sandbox",
+      "Cache-Control": "private, max-age=86400",
+    });
+    return res.end(f.buf);
+  }
+
+  // 첨부파일 올리기: 본문은 파일 바이트 그대로 (base64로 바꾸면 1.3배 커지므로)
+  if (req.method === "POST" && url.pathname === "/upload") {
+    const { room, client } = auth({ room: url.searchParams.get("room"), clientId: url.searchParams.get("clientId") });
+    const done = (status, data) => {
+      res.setHeader("Connection", "close"); // 거절한 경우 남은 업로드를 더 받지 않음
+      json(res, status, data);
+    };
+    if (!client) return done(403, { error: "not joined" });
+    const name = cleanFileName(url.searchParams.get("name"));
+    if (BLOCKED_EXT.has(extOf(name))) return done(415, { error: "blocked type" });
+    const declared = Number(req.headers["content-length"]);
+    if (declared > MAX_FILE_BYTES) return done(413, { error: "too large" });
+    if (totalFileBytes + (declared || 0) > TOTAL_FILE_BYTES) return done(507, { error: "server full" });
+    if (!allowed(url.searchParams.get("clientId"))) return done(429, { error: "slow down" });
+    let buf;
+    try {
+      buf = await readRaw(req, MAX_FILE_BYTES);
+    } catch (e) {
+      return done(e.message === "too large" ? 413 : 400, { error: "upload failed" });
+    }
+    if (!buf.length) return done(400, { error: "empty" });
+    if (totalFileBytes + buf.length > TOTAL_FILE_BYTES) return done(507, { error: "server full" });
+    const url2 = storeFile(room, name, buf);
+    addMessage(room, { type: "file", name: client.name, from: client.publicId, at: Date.now(), file: { name, size: buf.length, url: url2 } });
+    room.reads.set(client.publicId, room.seq);
+    return json(res, 200, { ok: true });
   }
 
   // 입장. deviceKey는 브라우저 탭마다 고정이라 새로고침해도 같은 사람으로 인식됨

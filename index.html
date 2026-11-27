@@ -132,6 +132,21 @@
   .bb.photo::before { display: none; }
   .bb.photo img { display: block; max-width: min(240px, 60vw); max-height: 240px; border: 1px solid #d0d0d0; cursor: zoom-in; background: #f4f4f4; }
   .bb.photo .gone { padding: 18px 16px; border: 1px dashed #bdbdbd; background: #fafafa; color: var(--ink3); }
+  /* 첨부파일 카드 (레퍼런스: 아이콘 + 파일명 + 용량, 아래 저장 링크) */
+  .bb.file { padding: 8px 12px 8px 8px; min-width: 190px; max-width: 260px; }
+  .fcard { display: flex; align-items: center; gap: 9px; }
+  .ficon {
+    flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+    color: #fff; font-size: 9px; font-weight: 700; letter-spacing: -.3px; background: #7a8894;
+  }
+  .finfo { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fsize { font-size: 11px; color: var(--ink3); }
+  .flinks { font-size: 12px; margin-top: 3px; }
+  .flinks a { color: #111; text-decoration: underline; }
+  .flinks a:hover { color: #1d4f88; }
+  .m.me .flinks { text-align: right; }
+  .fgone { color: var(--ink3); }
   .bb.hit { outline: 2px solid #f5b400; }
   .bb.hit-cur { outline: 2px solid #217346; }
 
@@ -307,12 +322,13 @@
   </form>
   <div class="tools">
     <button type="button" id="emojiBtn" title="이모지"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="9" r="7.5"/><circle cx="6.3" cy="7.3" r=".9" fill="currentColor"/><circle cx="11.7" cy="7.3" r=".9" fill="currentColor"/><path d="M5.8 11a3.7 3.7 0 0 0 6.4 0"/></svg></button>
-    <button type="button" id="attachBtn" title="사진 첨부"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 8.5 9 14.5a3.9 3.9 0 0 1-5.5-5.5l6.3-6.3a2.6 2.6 0 0 1 3.7 3.7L7.2 12.7a1.3 1.3 0 0 1-1.9-1.9L11 5"/></svg></button>
+    <button type="button" id="attachBtn" title="파일 첨부 (최대 20MB)"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 8.5 9 14.5a3.9 3.9 0 0 1-5.5-5.5l6.3-6.3a2.6 2.6 0 0 1 3.7 3.7L7.2 12.7a1.3 1.3 0 0 1-1.9-1.9L11 5"/></svg></button>
     <button type="button" id="photoBtn" title="사진 보내기"><svg width="18" height="16" viewBox="0 0 18 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1.5" width="16" height="13" rx="1"/><circle cx="6" cy="6" r="1.5"/><path d="m1.5 13 5-5 3.5 3.5 2.5-2.5 4 4"/></svg></button>
     <button type="button" id="pasteBtn" title="캡처 이미지 붙여넣기"><svg width="19" height="17" viewBox="0 0 19 17" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3.5" width="13" height="10" rx="1"/><path d="m3.5 12.5 3.5-3.5 2.5 2.5 2-2 3.5 3"/><path d="M1 5V1h4M14 1h4v4M18 12v4h-4M5 16H1v-4"/></svg></button>
     <div class="emoji-pop" id="emojiPop"></div>
   </div>
   <input type="file" id="fileInput" accept="image/*" multiple hidden />
+  <input type="file" id="anyFileInput" multiple hidden />
 
   <!-- 입장 대화상자 -->
   <div class="dialog-wrap" id="joinView">
@@ -327,7 +343,7 @@
     </div>
   </div>
 
-  <div class="dropzone" id="dropzone">여기에 사진을 놓으면 보내져요</div>
+  <div class="dropzone" id="dropzone">여기에 놓으면 보내져요 (사진·파일 20MB까지)</div>
 </div>
 <div class="lightbox" id="lightbox"><img id="lightboxImg" alt="" /></div>
 <div class="toast" id="toast"></div>
@@ -472,6 +488,60 @@
     return img;
   }
 
+  const FILE_KINDS = [
+    [/^(hwp|hwpx|hwt)$/, "한", "#1e8fe1"],
+    [/^pdf$/, "PDF", "#d93025"],
+    [/^(xls|xlsx|xlsm|csv)$/, "XLS", "#217346"],
+    [/^(ppt|pptx)$/, "PPT", "#d24726"],
+    [/^(doc|docx|rtf)$/, "DOC", "#2b579a"],
+    [/^(zip|7z|rar|alz|egg|tar|gz)$/, "ZIP", "#8a6d3b"],
+    [/^(mp4|mov|avi|mkv|webm|wmv)$/, "VID", "#6f42c1"],
+    [/^(mp3|wav|m4a|aac|flac)$/, "AUD", "#e83e8c"],
+    [/^(txt|md|log)$/, "TXT", "#6c757d"],
+  ];
+  const fileExt = (name) => (/\.([^.]+)$/.exec(name) || [])[1]?.toLowerCase() || "";
+  function fmtSize(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  function fillFileCard(bb, msg) {
+    bb.innerHTML = "";
+    const f = msg.file || {};
+    const ext = fileExt(f.name || "");
+    const kind = FILE_KINDS.find(([re]) => re.test(ext));
+    const card = document.createElement("div");
+    card.className = "fcard";
+    const icon = document.createElement("div");
+    icon.className = "ficon";
+    icon.textContent = kind ? kind[1] : (ext.slice(0, 4).toUpperCase() || "FILE");
+    if (kind) icon.style.background = kind[2];
+    const info = document.createElement("div");
+    info.className = "finfo";
+    const nm = document.createElement("div");
+    nm.className = "fname";
+    nm.textContent = f.name;
+    nm.title = f.name;
+    const sz = document.createElement("div");
+    sz.className = "fsize";
+    sz.textContent = fmtSize(f.size || 0);
+    info.append(nm, sz);
+    card.append(icon, info);
+    const links = document.createElement("div");
+    links.className = "flinks";
+    if (msg.expired) {
+      links.innerHTML = '<span class="fgone">보관 기간이 지난 파일이에요</span>';
+    } else {
+      const a = document.createElement("a");
+      a.href = f.url;
+      a.download = f.name;
+      a.textContent = "저장";
+      links.appendChild(a);
+    }
+    bb.append(card, links);
+  }
+
   function render(msg) {
     if (msgs.has(msg.id)) return;
     const box = $("msgs");
@@ -511,6 +581,9 @@
         const node = photoNode(msg);
         node._stick = stick;
         bb.appendChild(node);
+      } else if (msg.type === "file") {
+        bb.className = "bb file";
+        fillFileCard(bb, msg);
       } else {
         bb.className = "bb";
         bb.textContent = msg.text; // textContent로 넣어 HTML 삽입 차단
@@ -657,6 +730,8 @@
         entry.data.expired = true;
         const bb = entry.el.querySelector(".bb.photo");
         if (bb) { bb.innerHTML = ""; bb.appendChild(photoNode(entry.data)); }
+        const fb = entry.el.querySelector(".bb.file");
+        if (fb) fillFileCard(fb, entry.data);
       }
     }
   }
@@ -713,7 +788,7 @@
     beep();
     if ("Notification" in window && Notification.permission === "granted") {
       try {
-        const n = new Notification(msg.name, { body: msg.type === "image" ? "사진을 보냈어요" : msg.text.slice(0, 80), tag: "sheet-chat", silent: true });
+        const n = new Notification(msg.name, { body: msg.type === "image" ? "사진을 보냈어요" : msg.type === "file" ? `파일: ${msg.file.name}` : msg.text.slice(0, 80), tag: "sheet-chat", silent: true });
         n.onclick = () => { focus(); n.close(); };
       } catch {} // 모바일 일부 브라우저는 페이지에서 직접 알림을 띄울 수 없음
     }
@@ -854,8 +929,60 @@
       }
     }
   }
-  $("attachBtn").onclick = $("photoBtn").onclick = () => $("fileInput").click();
+  /* ── 첨부파일 ── */
+  const MAX_FILE = 20 * 1024 * 1024;
+  const BLOCKED = new Set("exe bat cmd com msi msp scr pif cpl dll sys js jse vbs vbe wsf wsh hta ps1 psm1 psd1 reg lnk jar msc appx msix appxbundle application gadget sh".split(" "));
+
+  // fetch는 업로드 진행률을 못 주므로 XHR 사용
+  function uploadOnce(file, onProgress) {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/upload?room=${encodeURIComponent(room)}&clientId=${me.clientId}&name=${encodeURIComponent(file.name)}`);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.onload = () => resolve(xhr.status);
+      xhr.onerror = () => resolve(0);
+      xhr.send(file);
+    });
+  }
+
+  async function sendFiles(files) {
+    if (!me.joined) return;
+    for (const f of files) {
+      if (BLOCKED.has(fileExt(f.name))) { toast(`실행 파일은 보낼 수 없어요 (${f.name})`); continue; }
+      if (f.size > MAX_FILE) { toast(`20MB 이하 파일만 보낼 수 있어요 (${fmtSize(f.size)})`); continue; }
+      if (!f.size) { toast("빈 파일은 보낼 수 없어요."); continue; }
+      let status = 0;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await ensureJoined();
+        status = await uploadOnce(f, (p) => toast(`파일 올리는 중… ${Math.round(p * 100)}%`));
+        if (status !== 403) break;
+        me.clientId = null; // 서버 재시작 등 → 다시 입장 후 재시도
+      }
+      if (status === 200) continue;
+      toast(
+        status === 413 ? "20MB 이하 파일만 보낼 수 있어요."
+        : status === 415 ? "실행 파일은 보낼 수 없어요."
+        : status === 507 ? "서버 보관 공간이 가득 찼어요. 잠시 후 다시 보내 주세요."
+        : status === 429 ? "너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요."
+        : "파일을 보내지 못했어요."
+      );
+    }
+  }
+
+  // 사진은 줄여서 사진으로, 나머지는 첨부파일로
+  function sendAny(fileList) {
+    const all = [...fileList];
+    const imgs = all.filter((f) => /^image\/(jpeg|png|webp|gif|bmp)$/.test(f.type));
+    const rest = all.filter((f) => !imgs.includes(f));
+    if (imgs.length) sendImages(imgs);
+    if (rest.length) sendFiles(rest);
+  }
+
+  $("photoBtn").onclick = () => $("fileInput").click();
+  $("attachBtn").onclick = () => $("anyFileInput").click();
   $("fileInput").onchange = (e) => { sendImages(e.target.files); e.target.value = ""; };
+  $("anyFileInput").onchange = (e) => { sendAny(e.target.files); e.target.value = ""; };
   $("pasteBtn").onclick = async () => {
     try {
       const items = await navigator.clipboard.read();
@@ -872,8 +999,8 @@
     }
   };
   document.addEventListener("paste", (e) => {
-    const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
-    if (files.length) { e.preventDefault(); sendImages(files); }
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) { e.preventDefault(); sendAny(files); }
   });
   let dragDepth = 0;
   addEventListener("dragenter", (e) => { if (me.joined && e.dataTransfer?.types.includes("Files")) { dragDepth++; $("dropzone").classList.add("show"); } });
@@ -883,7 +1010,7 @@
     e.preventDefault();
     dragDepth = 0;
     $("dropzone").classList.remove("show");
-    if (e.dataTransfer?.files.length) sendImages(e.dataTransfer.files);
+    if (e.dataTransfer?.files.length) sendAny(e.dataTransfer.files);
   });
   $("lightbox").onclick = () => $("lightbox").classList.remove("open");
 
